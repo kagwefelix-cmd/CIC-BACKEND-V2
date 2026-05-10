@@ -12,7 +12,7 @@ const OPEN = {
 
 const SITE =
   process.env.NEXT_PUBLIC_SITE_URL ||
-  '[chattersinnercircle.vercel.app](https://chattersinnercircle.vercel.app)';
+  '[chatterinnercircle.vercel.app](https://chatterinnercircle.vercel.app)';
 
 export async function OPTIONS() {
   return new NextResponse(null, { status: 204, headers: OPEN });
@@ -22,7 +22,6 @@ export async function POST(req: NextRequest) {
   let email = '';
   let referralCode = '';
 
-  // Parse request body safely
   try {
     const body = await req.json();
     email = (body.email || '').trim().toLowerCase();
@@ -41,7 +40,6 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Create Supabase anon client
   const anon = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
@@ -80,21 +78,18 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Optional referral insert using service role key
   if (referralCode) {
     try {
       const db = createClient(
         process.env.NEXT_PUBLIC_SUPABASE_URL!,
         process.env.SUPABASE_SERVICE_ROLE_KEY!
       );
-      await db
-        .from('pro_requests')
-        .insert({
-          email,
-          request_type: 'referral_signup',
-          payment_method: referralCode,
-          status: 'pending',
-        });
+      await db.from('pro_requests').insert({
+        email,
+        request_type: 'referral_signup',
+        payment_method: referralCode,
+        status: 'pending',
+      });
     } catch (err: any) {
       console.error('[referral-insert] non-fatal error:', err);
     }
