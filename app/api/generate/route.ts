@@ -12,7 +12,7 @@ function getSupabase() {
 
 const ALLOWED_ORIGINS = [
   'chrome-extension://dkgpheiimhedhdfandcgeogmbfmmiobp',
-  'https://cic-app.pages.dev',
+  'https://chattersinnercircle.vercel.app',
   'https://chattersinnercircle.vercel.app',
   'https://chathomebase.com',
   'https://www.chathomebase.com',
@@ -27,15 +27,17 @@ const ALLOWED_ORIGINS = [
   'https://www.manyvids.com',
   'https://unlockd.com',
   'https://agents.moderationinterface.com',
+  'https://chatterapply.com',
+  'https://www.chatterapply.com',
   'http://localhost:3000',
 ];
 
 function cors(origin: string | null) {
   // If origin is in our allowed list, echo it back exactly.
-  // If not (or null -- same-origin / server-side calls), allow cic-app.pages.dev.
+  // If not (or null -- same-origin / server-side calls), allow chattersinnercircle.vercel.app.
   const o = origin && ALLOWED_ORIGINS.includes(origin)
     ? origin
-    : 'https://cic-app.pages.dev';
+    : 'https://chattersinnercircle.vercel.app';
   return {
     'Access-Control-Allow-Origin': o,
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
@@ -110,8 +112,9 @@ export async function POST(req: NextRequest) {
 
   // -- Validate operator and enforce 3-tier plan system ------------
   // FREE   = 7-day trial: days 1-3 full Pro, days 4-7 reducing limit (20/day)
-  // BASIC  = $8/mo: 50 replies per 4 days, no explicit content, standard AI
-  // PRO    = $15/mo: unlimited, explicit content, premium AI
+  // FREE   = 7-day trial: days 1-3 premium 50/day, days 4-5 basic 30/day, day6 basic 20/day, day7 basic 10/day
+  // BASIC  = $8/mo: unlimited generic replies, no explicit content, standard AI
+  // PRO    = $15/mo: unlimited, full explicit/erotic content, premium AI
   if (userEmail) {
     const { data: profile } = await getSupabase()
       .from('profiles')
@@ -135,21 +138,28 @@ export async function POST(req: NextRequest) {
           );
         }
 
-        // Days 1-3: full Pro access (unlimited)
-        // Days 4-7: reduced to 20/day
+        // Trial tier limits:
+        // Days 1-3: 50 premium replies/day (Pro quality)
+        // Days 4-5: 30 basic replies/day (generic quality)
+        // Day 6:    20 basic replies/day
+        // Day 7:    10 basic replies/day
         const trialStart = new Date(trialEnd.getTime() - 7 * 24 * 60 * 60 * 1000);
         const dayOfTrial = Math.floor((now.getTime() - trialStart.getTime()) / (24 * 60 * 60 * 1000)) + 1;
-        const dailyLimit = dayOfTrial <= 3 ? 999999 : 20;
+        const dailyLimit = dayOfTrial <= 3 ? 50 : dayOfTrial <= 5 ? 30 : dayOfTrial === 6 ? 20 : 10;
+        const isPremiumDay = dayOfTrial <= 3;
 
         let dailyCount = profile.daily_generations || 0;
         if (profile.last_generation_date !== today) dailyCount = 0;
 
         if (dailyCount >= dailyLimit) {
           const msg = dayOfTrial <= 3
-            ? 'Daily limit reached.'
-            : `Day ${dayOfTrial} of trial: 20 replies/day limit reached. Upgrade for unlimited access.`;
-          return NextResponse.json({ error: msg, upgrade: true }, { status: 403, headers: h });
+            ? `Day ${dayOfTrial} of trial: ${dailyLimit} premium replies/day limit reached. Upgrade to Pro for unlimited access.`
+            : `Day ${dayOfTrial} of trial: ${dailyLimit} replies/day limit reached. Upgrade to Basic or Pro for more.`;
+          return NextResponse.json({ error: msg, upgrade: true, trialDay: dayOfTrial }, { status: 403, headers: h });
         }
+        
+        // Pass isPremiumDay to prompt builder so days 4-7 get basic responses
+        (pageContext as any).trialPremium = isPremiumDay;
 
         await getSupabase().from('profiles').update({
           daily_generations:    dailyCount + 1,
@@ -172,12 +182,8 @@ export async function POST(req: NextRequest) {
         let dailyCount = profile.daily_generations || 0;
         if (profile.last_generation_date !== today) dailyCount = 0;
 
-        if (dailyCount >= 50) {
-          return NextResponse.json(
-            { error: 'Basic plan: 50 replies per day limit reached. Upgrade to Pro for unlimited replies.', upgrade: true },
-            { status: 403, headers: h }
-          );
-        }
+        // Basic plan: unlimited generic replies -- no daily cap
+        // (quality is standard/generic, no explicit content)
 
         await getSupabase().from('profiles').update({
           daily_generations:    dailyCount + 1,
@@ -211,6 +217,16 @@ export async function POST(req: NextRequest) {
   const isCold    = pageContext.isColdClient || false;
   const coldSigs  = pageContext.coldClientSignals || null;
 
+  // Quality tier: Pro gets premium+explicit, Basic gets standard, trial days 4-7 get basic
+  const isPro     = profile?.plan === 'pro';
+  const isBasic   = profile?.plan === 'basic';
+  const trialPremium = (pageContext as any).trialPremium !== false;
+  const allowExplicit  = isPro;
+  const allowPremium   = isPro || (profile?.plan === 'free' && trialPremium);
+  const qualityNote    = allowPremium
+    ? '-- PREMIUM QUALITY: replies must be deeply personal, emotionally intelligent, specific to his message, psychologically engaging. Never generic. Never surface-level.'
+    : '-- STANDARD QUALITY: warm and engaging generic replies. Competent but not premium. No explicit content.';
+
   // -- Build system prompt based on platform and scenario --------
   let systemPrompt: string;
   let userPrompt:   string;
@@ -221,11 +237,11 @@ export async function POST(req: NextRequest) {
     userPrompt   = message; // already the full cold client prompt from content script
   } else if (platform === 'alphadate' && scenario) {
     // Active conversation or first outreach -- use category rules
-    systemPrompt = buildAlphadateSystemPrompt(scenario, message);
+    systemPrompt = buildAlphadateSystemPrompt(scenario, message) + '\n\n' + qualityNote;
     userPrompt   = buildAlphadateUserPrompt(message, pageContext, scenario);
   } else {
     // Other platforms -- generic chatter assistant
-    systemPrompt = buildGenericSystemPrompt(platform);
+    systemPrompt = buildGenericSystemPrompt(platform, allowExplicit) + '\n\n' + qualityNote;
     userPrompt   = buildGenericUserPrompt(message, pageContext);
   }
 
@@ -368,7 +384,7 @@ function buildAlphadateUserPrompt(message: string, ctx: any, scenario: any): str
   return parts.join('\n');
 }
 
-function buildGenericSystemPrompt(platform: string): string {
+function buildGenericSystemPrompt(platform: string, allowExplicit = false): string {
 
   const tfRules = `Texting Factory / chathomebase.com (chathomebase.com). ABSOLUTE STRICT RULES -- violating any of these will get the operator banned:
 
@@ -395,13 +411,14 @@ TONE AND QUALITY RULES:
   const platformRules: Record<string, string> = {
     chathomebase:   tfRules,
     textingfactory: tfRules,
-    onlyfans:  'OnlyFans platform. Replies can be warm to explicit depending on context. Keep replies personal -- reference specific things he said. Match his energy. Upsell naturally when the opportunity arises.',
-    fansly:    'Fansly platform. Similar to OnlyFans. Warm, engaging, personal. Can be explicit in adult context. Always reference something specific from the conversation.',
+    onlyfans:  allowExplicit ? 'OnlyFans platform. Replies can range from warm and flirty to fully explicit and erotic depending on his energy. Reference specific things he said. Match his energy exactly. Build arousal progressively. Upsell naturally.' : 'OnlyFans platform. Warm, engaging, flirty replies. Reference what he said. Build connection. No explicit content.',
+    fansly:    allowExplicit ? 'Fansly platform. Warm to fully explicit depending on context. Always reference something specific. Match his energy. Make it feel personal and real.' : 'Fansly platform. Warm, engaging, personal. Flirty but clean. Reference what he said.',
     loyalfans: 'LoyalFans platform. Similar to OnlyFans. Warm and personal. Reference what he said. Build connection over time.',
     fancentro: 'FanCentro platform. Warm, engaging, personal replies. Match his tone. Build rapport.',
     admireme:  'AdmireMe platform. Warm, engaging. Keep replies personal and varied.',
     fanvue:    'FanVue platform. Warm, engaging, personal. Match his energy.',
-    manyvids:  'ManyVids platform. Warm and personal. Reference what he said specifically.',
+    manyvids:      'ManyVids platform. Warm and personal. Reference what he said specifically.',
+    chatterapply:  'ChatterApply platform -- OnlyFans chatting agency. Professional yet warm. 75-250 characters. Always include a CTA. No explicit content. Never mention meeting in person. Never share contact info. No emojis. Never name the platform.',
     unlockd:   'Unlockd platform. Warm, engaging, personal replies.',
     alphadate: 'Alpha.date dating platform. Men aged 40-80 from Western countries. Mature, warm, calm, emotionally intelligent tone. Never sound desperate or generic.',
     generic:   'General dating or chat platform. Warm, engaging, personal replies.',
